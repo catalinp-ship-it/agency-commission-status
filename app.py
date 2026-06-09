@@ -54,6 +54,14 @@ def sidebar() -> DashboardConfig:
     )
     cfg.currency_symbol = st.sidebar.text_input("Currency symbol", value=cfg.currency_symbol)
 
+    version_choice = st.sidebar.selectbox(
+        "API version",
+        ["auto", "v1", "v2"],
+        index=["auto", "v1", "v2"].index(cfg.api_version if cfg.api_version in ("auto", "v1", "v2") else "auto"),
+        help="Auto tries v2 then falls back to v1. v1 needs only an API key; v2 also needs an Account ID.",
+    )
+    cfg.api_version = version_choice
+
     cfg.demo_mode = st.sidebar.toggle(
         "Demo mode (sample data)",
         value=cfg.demo_mode or not cfg.has_credentials,

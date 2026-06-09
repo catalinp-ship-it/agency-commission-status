@@ -38,10 +38,15 @@ class DashboardConfig:
     demo_mode: bool = field(
         default_factory=lambda: os.getenv("FP_DEMO", "").lower() in {"1", "true", "yes"}
     )
+    # 'auto' tries v2 then falls back to v1; or force 'v1' / 'v2'.
+    api_version: str = field(default_factory=lambda: os.getenv("FP_API_VERSION", "auto"))
 
     @property
     def has_credentials(self) -> bool:
-        return bool(self.api_key and self.account_id)
+        # v1 needs only an API key; v2 also needs an Account ID. Auto handles both.
+        if self.api_version == "v2":
+            return bool(self.api_key and self.account_id)
+        return bool(self.api_key)
 
     def money(self, value: float) -> str:
         try:

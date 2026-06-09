@@ -22,9 +22,11 @@ and can be reused server-side:
 """
 
 from .config import DashboardConfig
-from .fp_client import FirstPromoterClient, FirstPromoterError
+from .fp_client import FirstPromoterClient, FirstPromoterV1Client, FirstPromoterError
 from .data import (
     fetch_live,
+    fetch_live_v1,
+    fetch_live_v2,
     fetch_demo,
     commissions_to_df,
     promoters_to_df,
@@ -45,8 +47,11 @@ from .views import (
 __all__ = [
     "DashboardConfig",
     "FirstPromoterClient",
+    "FirstPromoterV1Client",
     "FirstPromoterError",
     "fetch_live",
+    "fetch_live_v1",
+    "fetch_live_v2",
     "fetch_demo",
     "commissions_to_df",
     "promoters_to_df",

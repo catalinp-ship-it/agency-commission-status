@@ -28,16 +28,17 @@ from .data import fetch_demo, fetch_live
 # Data loading (cached)
 # --------------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner="Loading FirstPromoter data…")
-def _cached_fetch(api_key, account_id, threshold_days, demo, _buster):
-    if demo or not (api_key and account_id):
+def _cached_fetch(api_key, account_id, threshold_days, demo, api_version, _buster):
+    if demo or not api_key:
         return fetch_demo(threshold_days)
-    return fetch_live(api_key, account_id, threshold_days)
+    return fetch_live(api_key, account_id, threshold_days, api_version)
 
 
 def load_data(cfg: DashboardConfig, refresh_token: int = 0) -> Dict[str, pd.DataFrame]:
     """Load (and cache) dashboard data. Bump `refresh_token` to force a refresh."""
     return _cached_fetch(
-        cfg.api_key, cfg.account_id, cfg.threshold_days, cfg.demo_mode, refresh_token
+        cfg.api_key, cfg.account_id, cfg.threshold_days, cfg.demo_mode,
+        cfg.api_version, refresh_token,
     )
 
 

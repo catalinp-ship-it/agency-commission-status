@@ -24,6 +24,10 @@ MAX_PAGES = 500  # safety cap
 class FirstPromoterError(Exception):
     """Raised when the FirstPromoter API returns an error."""
 
+    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 def _flatten(prefix: str, value: Any, out: Dict[str, Any]) -> None:
     """Flatten a nested dict/list into bracketed query-param keys.
@@ -76,11 +80,11 @@ class FirstPromoterClient:
         resp = self.session.get(url, params=_build_params(params), timeout=self.timeout)
         if resp.status_code == 401:
             raise FirstPromoterError(
-                "Unauthorized (401). Check your API key."
+                "Unauthorized (401). Check your API key.", status_code=401
             )
         if resp.status_code == 403:
             raise FirstPromoterError(
-                "Forbidden (403). Check your Account-ID / key permissions."
+                "Forbidden (403). Check your Account-ID / key permissions.", status_code=403
             )
         if resp.status_code == 429:
             # basic backoff on rate limit
@@ -88,7 +92,8 @@ class FirstPromoterClient:
             resp = self.session.get(url, params=_build_params(params), timeout=self.timeout)
         if not resp.ok:
             raise FirstPromoterError(
-                f"API error {resp.status_code} on {path}: {resp.text[:300]}"
+                f"API error {resp.status_code} on {path}: {resp.text[:300]}",
+                status_code=resp.status_code,
             )
         return resp
 
@@ -156,4 +161,83 @@ class FirstPromoterClient:
     def ping(self) -> bool:
         """Lightweight credential check."""
         self._get("promoters", {"page": 1})
+        return True
+
+
+V1_BASE_URL = "https://firstpromoter.com/api/v1"
+
+
+class FirstPromoterV1Client:
+    """Client for the older FirstPromoter v1 API.
+
+    Auth is a single ``X-API-KEY`` header (no Account-ID). Endpoints live under
+    https://firstpromoter.com/api/v1 and paginate via ?page=N&per_page=N.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = V1_BASE_URL,
+        timeout: int = DEFAULT_TIMEOUT,
+        per_page: int = 100,
+    ) -> None:
+        if not api_key:
+            raise ValueError("api_key is required")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.per_page = per_page
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"X-API-KEY": api_key, "Accept": "application/json"}
+        )
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        resp = self.session.get(url, params=params or {}, timeout=self.timeout)
+        if resp.status_code == 401:
+            raise FirstPromoterError(
+                "Unauthorized (401). Check your API key.", status_code=401
+            )
+        if resp.status_code == 429:
+            time.sleep(2)
+            resp = self.session.get(url, params=params or {}, timeout=self.timeout)
+        if not resp.ok:
+            raise FirstPromoterError(
+                f"API v1 error {resp.status_code} on {path}: {resp.text[:300]}",
+                status_code=resp.status_code,
+            )
+        return resp
+
+    def _paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[dict]:
+        params = dict(params or {})
+        params["per_page"] = self.per_page
+        rows: List[dict] = []
+        seen_first_ids: set = set()
+        page = 1
+        while page <= MAX_PAGES:
+            params["page"] = page
+            payload = self._get(path, params).json()
+            batch = payload if isinstance(payload, list) else payload.get("data", [])
+            if not batch:
+                break
+            first_id = batch[0].get("id")
+            if first_id is not None:
+                if first_id in seen_first_ids and page > 1:
+                    break
+                seen_first_ids.add(first_id)
+            rows.extend(batch)
+            if len(batch) < self.per_page:
+                break
+            page += 1
+        return rows
+
+    def get_promoters(self) -> List[dict]:
+        return self._paginate("promoters/list")
+
+    def get_rewards(self) -> List[dict]:
+        """All rewards/commissions (the v1 equivalent of commissions)."""
+        return self._paginate("rewards/list")
+
+    def ping(self) -> bool:
+        self._get("promoters/list", {"page": 1, "per_page": 1})
         return True

@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .fp_client import FirstPromoterClient
+from .fp_client import FirstPromoterClient, FirstPromoterV1Client, FirstPromoterError
 
 # Commission amounts come back as integer minor units (cents).
 AMOUNT_DIVISOR = 100.0
@@ -200,18 +200,122 @@ def build_promoter_summary(
 
 
 # --------------------------------------------------------------------------
+# v1 adapters: reshape the older API's payloads into the v2 structure the
+# DataFrame builders already understand, so the rest of the code is unchanged.
+# --------------------------------------------------------------------------
+def _v1_reward_is_paid(r: dict) -> bool:
+    # The v1 reward schema doesn't formally document a paid flag, but live
+    # responses commonly include one of these. Treat any as "paid".
+    for key in ("paid", "is_paid", "paid_at", "payout_id"):
+        v = r.get(key)
+        if isinstance(v, bool) and v:
+            return True
+        if not isinstance(v, bool) and v:
+            return True
+    return False
+
+
+def _v1_reward_to_v2_commission(r: dict) -> dict:
+    promoter = r.get("promoter") or {}
+    promotion = r.get("promotion") or {}
+    lead = r.get("lead") or {}
+    return {
+        "id": r.get("id"),
+        "status": r.get("status"),
+        "unit": r.get("unit") or "cash",
+        "amount": r.get("amount") or 0,
+        "sale_amount": r.get("conversion_amount") or 0,
+        "is_paid": _v1_reward_is_paid(r),
+        "commission_type": "sale",
+        "created_at": r.get("created_at"),
+        "promoter_campaign": {
+            "promoter_id": promoter.get("id"),
+            "promoter": {
+                "id": promoter.get("id"),
+                "email": promoter.get("email"),
+                "name": promoter.get("email"),  # v1 reward has no name; filled later
+            },
+            "campaign": {"name": promotion.get("campaign_name")},
+        },
+        "referral": {"email": (lead or {}).get("email") if isinstance(lead, dict) else None},
+    }
+
+
+def _v1_promoter_to_v2(p: dict) -> dict:
+    profile = p.get("profile") or {}
+    first = profile.get("first_name") or ""
+    last = profile.get("last_name") or ""
+    name = (f"{first} {last}").strip() or p.get("email")
+    paypal = profile.get("paypal_email")
+    current = p.get("current_balance") or {}
+    return {
+        "id": p.get("id"),
+        "name": name,
+        "email": p.get("email"),
+        "is_confirmed": p.get("status") in ("approved", "active"),
+        "invoice_details_status": None,  # not exposed in v1
+        "joined_at": p.get("created_at"),
+        "profile": {
+            "country": profile.get("country"),
+            "company_name": profile.get("company_name"),
+            "w8_form_url": p.get("w8_form_url"),
+            "w9_form_url": p.get("w9_form_url"),
+        },
+        "balances": {"cash": (current.get("cash") or 0) / AMOUNT_DIVISOR},
+        "selected_payout_method": ({"method": "paypal", "is_disabled": False} if paypal else None),
+    }
+
+
+# --------------------------------------------------------------------------
 # Fetch orchestration
 # --------------------------------------------------------------------------
-def fetch_live(
-    api_key: str, account_id: str, threshold_days: int
-) -> Dict[str, pd.DataFrame]:
-    client = FirstPromoterClient(api_key, account_id)
-    commissions_raw = client.get_commissions()
-    promoters_raw = client.get_promoters()
+def _build(commissions_raw, promoters_raw, threshold_days) -> Dict[str, pd.DataFrame]:
     commissions = commissions_to_df(commissions_raw, threshold_days)
     promoters = promoters_to_df(promoters_raw)
+    # v1 commission rows lack promoter names; backfill from the promoters table.
+    if not commissions.empty and not promoters.empty:
+        name_map = promoters.set_index("promoter_id")["promoter_name"].to_dict()
+        missing = commissions["promoter_name"].isna() | (
+            commissions["promoter_name"] == commissions["promoter_email"]
+        )
+        commissions.loc[missing, "promoter_name"] = commissions.loc[missing, "promoter_id"].map(
+            name_map
+        ).fillna(commissions.loc[missing, "promoter_name"])
     summary = build_promoter_summary(commissions, promoters, threshold_days)
     return {"commissions": commissions, "promoters": promoters, "summary": summary}
+
+
+def fetch_live_v2(api_key: str, account_id: str, threshold_days: int) -> Dict[str, pd.DataFrame]:
+    client = FirstPromoterClient(api_key, account_id)
+    return _build(client.get_commissions(), client.get_promoters(), threshold_days)
+
+
+def fetch_live_v1(api_key: str, threshold_days: int) -> Dict[str, pd.DataFrame]:
+    client = FirstPromoterV1Client(api_key)
+    rewards = [_v1_reward_to_v2_commission(r) for r in client.get_rewards()]
+    promoters = [_v1_promoter_to_v2(p) for p in client.get_promoters()]
+    return _build(rewards, promoters, threshold_days)
+
+
+def fetch_live(
+    api_key: str, account_id: str, threshold_days: int, api_version: str = "auto"
+) -> Dict[str, pd.DataFrame]:
+    """Fetch live data. api_version: 'auto' (try v2, fall back to v1), 'v2', or 'v1'."""
+    version = (api_version or "auto").lower()
+    if version == "v1":
+        return fetch_live_v1(api_key, threshold_days)
+    if version == "v2":
+        return fetch_live_v2(api_key, account_id, threshold_days)
+    # auto: without an Account ID, v2 can't work — go straight to v1.
+    if not account_id:
+        return fetch_live_v1(api_key, threshold_days)
+    # auto: try v2, fall back to v1 if v2 isn't available for this key/account.
+    try:
+        return fetch_live_v2(api_key, account_id, threshold_days)
+    except FirstPromoterError as e:
+        if e.status_code in (401, 403, 404) or "invalid_route" in str(e):
+            return fetch_live_v1(api_key, threshold_days)
+        raise
 
 
 # --------------------------------------------------------------------------
