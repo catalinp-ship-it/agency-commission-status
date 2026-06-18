@@ -187,8 +187,14 @@ class FirstPromoterV1Client:
         self.timeout = timeout
         self.per_page = per_page
         self.session = requests.Session()
+        # FirstPromoter v1 authenticates with a Bearer token. Do NOT also send
+        # X-API-KEY: when both are present the server validates X-API-KEY and
+        # rejects the request (401), even though the Bearer token is valid.
         self.session.headers.update(
-            {"X-API-KEY": api_key, "Accept": "application/json"}
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            }
         )
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
