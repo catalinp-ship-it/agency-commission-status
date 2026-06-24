@@ -5,8 +5,10 @@ into tidy pandas DataFrames with the derived fields the dashboard needs
 
 from __future__ import annotations
 
+import json
 import random
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -15,6 +17,37 @@ from .fp_client import FirstPromoterClient, FirstPromoterV1Client, FirstPromoter
 
 # Commission amounts come back as integer minor units (cents).
 AMOUNT_DIVISOR = 100.0
+
+# Where GitHub Actions saves pre-fetched data.
+_DATA_DIR = Path(__file__).parent.parent / "data"
+
+
+def _load_json_cache() -> Optional[Dict[str, List[dict]]]:
+    """Load pre-fetched data from data/ if it exists (written by fetch_data.py / GitHub Actions)."""
+    rewards_file = _DATA_DIR / "rewards.json"
+    promoters_file = _DATA_DIR / "promoters.json"
+    if rewards_file.exists() and promoters_file.exists():
+        try:
+            rewards = json.loads(rewards_file.read_text())
+            promoters = json.loads(promoters_file.read_text())
+            if rewards or promoters:
+                return {"rewards": rewards, "promoters": promoters}
+        except Exception:
+            pass
+    return None
+
+
+def _cache_age_hours() -> Optional[float]:
+    manifest = _DATA_DIR / "manifest.json"
+    if not manifest.exists():
+        return None
+    try:
+        data = json.loads(manifest.read_text())
+        fetched_at = datetime.fromisoformat(data["fetched_at"].replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - fetched_at
+        return age.total_seconds() / 3600
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -285,36 +318,67 @@ def _build(commissions_raw, promoters_raw, threshold_days) -> Dict[str, pd.DataF
     return {"commissions": commissions, "promoters": promoters, "summary": summary}
 
 
-def fetch_live_v2(api_key: str, account_id: str, threshold_days: int) -> Dict[str, pd.DataFrame]:
+def _cutoff(lookback_months: int):
+    """Return a timezone-aware datetime `lookback_months` ago, or None for no limit."""
+    if not lookback_months:
+        return None
+    from datetime import timezone as _tz
+    now = datetime.now(_tz.utc)
+    # Subtract months manually (no dateutil dependency).
+    month = now.month - lookback_months
+    year = now.year + month // 12
+    month = month % 12 or 12
+    if month == 0:
+        month = 12
+        year -= 1
+    return now.replace(year=year, month=month)
+
+
+def fetch_live_v2(
+    api_key: str, account_id: str, threshold_days: int, lookback_months: int = 18
+) -> Dict[str, pd.DataFrame]:
     client = FirstPromoterClient(api_key, account_id)
-    return _build(client.get_commissions(), client.get_promoters(), threshold_days)
+    cutoff = _cutoff(lookback_months)
+    commissions_raw = client.get_commissions(cutoff_date=cutoff)
+    promoters_raw = client.get_promoters()
+    return _build(commissions_raw, promoters_raw, threshold_days)
 
 
-def fetch_live_v1(api_key: str, threshold_days: int) -> Dict[str, pd.DataFrame]:
+def fetch_live_v1(api_key: str, threshold_days: int, lookback_months: int = 18) -> Dict[str, pd.DataFrame]:
     client = FirstPromoterV1Client(api_key)
-    rewards = [_v1_reward_to_v2_commission(r) for r in client.get_rewards()]
+    cutoff = _cutoff(lookback_months)
+    rewards = [_v1_reward_to_v2_commission(r) for r in client.get_rewards(cutoff_date=cutoff)]
     promoters = [_v1_promoter_to_v2(p) for p in client.get_promoters()]
     return _build(rewards, promoters, threshold_days)
 
 
 def fetch_live(
-    api_key: str, account_id: str, threshold_days: int, api_version: str = "auto"
+    api_key: str, account_id: str, threshold_days: int, api_version: str = "auto",
+    lookback_months: int = 18,
 ) -> Dict[str, pd.DataFrame]:
-    """Fetch live data. api_version: 'auto' (try v2, fall back to v1), 'v2', or 'v1'."""
+    """Fetch live data — reads from pre-fetched JSON files when available (GitHub Actions pipeline),
+    falls back to live API only if files are missing or stale."""
+
+    # 1. Try the pre-fetched JSON cache written by GitHub Actions / fetch_data.py.
+    cached = _load_json_cache()
+    if cached:
+        rewards = [_v1_reward_to_v2_commission(r) for r in cached["rewards"]]
+        promoters = [_v1_promoter_to_v2(p) for p in cached["promoters"]]
+        return _build(rewards, promoters, threshold_days)
+
+    # 2. No local files — fall back to live API.
     version = (api_version or "auto").lower()
     if version == "v1":
-        return fetch_live_v1(api_key, threshold_days)
+        return fetch_live_v1(api_key, threshold_days, lookback_months)
     if version == "v2":
-        return fetch_live_v2(api_key, account_id, threshold_days)
-    # auto: without an Account ID, v2 can't work — go straight to v1.
+        return fetch_live_v2(api_key, account_id, threshold_days, lookback_months)
     if not account_id:
-        return fetch_live_v1(api_key, threshold_days)
-    # auto: try v2, fall back to v1 if v2 isn't available for this key/account.
+        return fetch_live_v1(api_key, threshold_days, lookback_months)
     try:
-        return fetch_live_v2(api_key, account_id, threshold_days)
+        return fetch_live_v2(api_key, account_id, threshold_days, lookback_months)
     except FirstPromoterError as e:
         if e.status_code in (401, 403, 404) or "invalid_route" in str(e):
-            return fetch_live_v1(api_key, threshold_days)
+            return fetch_live_v1(api_key, threshold_days, lookback_months)
         raise
 
 

@@ -12,6 +12,7 @@ Auth (per docs.firstpromoter.com):
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -77,7 +78,18 @@ class FirstPromoterClient:
     # ---- low level -----------------------------------------------------
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
-        resp = self.session.get(url, params=_build_params(params), timeout=self.timeout)
+        built = _build_params(params)
+        # Retry on transient errors (429 rate-limit, 503/502/504 server hiccups).
+        _RETRYABLE = {429, 502, 503, 504}
+        _DELAYS = [2, 5, 10]
+        resp = None
+        for attempt, delay in enumerate([0] + _DELAYS):
+            if delay:
+                time.sleep(delay)
+            resp = self.session.get(url, params=built, timeout=self.timeout)
+            if resp.status_code not in _RETRYABLE:
+                break
+        assert resp is not None
         if resp.status_code == 401:
             raise FirstPromoterError(
                 "Unauthorized (401). Check your API key.", status_code=401
@@ -86,10 +98,6 @@ class FirstPromoterClient:
             raise FirstPromoterError(
                 "Forbidden (403). Check your Account-ID / key permissions.", status_code=403
             )
-        if resp.status_code == 429:
-            # basic backoff on rate limit
-            time.sleep(2)
-            resp = self.session.get(url, params=_build_params(params), timeout=self.timeout)
         if not resp.ok:
             raise FirstPromoterError(
                 f"API error {resp.status_code} on {path}: {resp.text[:300]}",
@@ -107,12 +115,17 @@ class FirstPromoterClient:
                 return payload["data"]
         return []
 
-    def _paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[dict]:
-        """Fetch every page. FirstPromoter paginates via ?page=N (25/page).
-
-        Stops when a page returns no rows or repeats the previous page.
-        """
+    def _paginate(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        per_page: int = 100,
+        cutoff_date: Optional[datetime] = None,
+    ) -> List[dict]:
+        """Fetch every page. Stops at cutoff_date (records are newest-first)."""
         params = dict(params or {})
+        params.setdefault("per_page", per_page)
+        page_size = params["per_page"]
         rows: List[dict] = []
         seen_first_ids: set = set()
         page = 1
@@ -122,25 +135,48 @@ class FirstPromoterClient:
             batch = self._extract_rows(payload)
             if not batch:
                 break
-            # guard against APIs that ignore `page` and keep returning page 1
             first_id = batch[0].get("id")
             if first_id is not None:
                 if first_id in seen_first_ids and page > 1:
                     break
                 seen_first_ids.add(first_id)
-            rows.extend(batch)
-            if len(batch) < 25:  # last (short) page
+            if cutoff_date:
+                filtered = []
+                stop = False
+                for row in batch:
+                    raw_date = row.get("created_at")
+                    if raw_date:
+                        try:
+                            dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            if dt < cutoff_date:
+                                stop = True
+                                break
+                        except (ValueError, AttributeError):
+                            pass
+                    filtered.append(row)
+                rows.extend(filtered)
+                if stop:
+                    break
+            else:
+                rows.extend(batch)
+            if len(batch) < page_size:
                 break
             page += 1
         return rows
 
     # ---- high level ----------------------------------------------------
-    def get_commissions(self, filters: Optional[Dict[str, Any]] = None) -> List[dict]:
+    def get_commissions(
+        self,
+        filters: Optional[Dict[str, Any]] = None,
+        cutoff_date: Optional[datetime] = None,
+    ) -> List[dict]:
         """All commissions/rewards. Optionally pass server-side `filters`."""
         params: Dict[str, Any] = {}
         if filters:
             params["filters"] = filters
-        return self._paginate("commissions", params)
+        return self._paginate("commissions", params, cutoff_date=cutoff_date)
 
     def get_promoters(self, filters: Optional[Dict[str, Any]] = None) -> List[dict]:
         """All promoters with profile, payout method and balances."""
@@ -167,11 +203,33 @@ class FirstPromoterClient:
 V1_BASE_URL = "https://firstpromoter.com/api/v1"
 
 
-class FirstPromoterV1Client:
-    """Client for the older FirstPromoter v1 API.
+def _make_cf_session(api_key: str, extra_headers: Optional[Dict[str, str]] = None):
+    """Return a cloudscraper session that mimics a real browser to bypass Cloudflare WAF.
 
-    Auth is a single ``X-API-KEY`` header (no Account-ID). Endpoints live under
-    https://firstpromoter.com/api/v1 and paginate via ?page=N&per_page=N.
+    Falls back to a plain requests.Session if cloudscraper is not installed.
+    """
+    headers = {"X-API-KEY": api_key, "Accept": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        import cloudscraper  # type: ignore
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        scraper.headers.update(headers)
+        return scraper
+    except Exception:  # noqa: BLE001 — cloudscraper not installed, degrade gracefully
+        session = requests.Session()
+        session.headers.update(headers)
+        return session
+
+
+class FirstPromoterV1Client:
+    """Client for the FirstPromoter v1 API (API-key only, no Account-ID required).
+
+    Uses cloudscraper to mimic a real browser and bypass Cloudflare WAF rate-limiting,
+    which blocks plain requests from shared hosting IPs (e.g. Streamlit Cloud).
+    Endpoints live under https://firstpromoter.com/api/v1.
     """
 
     def __init__(
@@ -186,27 +244,25 @@ class FirstPromoterV1Client:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.per_page = per_page
-        self.session = requests.Session()
-        # FirstPromoter v1 authenticates with a Bearer token. Do NOT also send
-        # X-API-KEY: when both are present the server validates X-API-KEY and
-        # rejects the request (401), even though the Bearer token is valid.
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {api_key}",
-                "Accept": "application/json",
-            }
-        )
+        self.session = _make_cf_session(api_key)
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
-        resp = self.session.get(url, params=params or {}, timeout=self.timeout)
+        built = params or {}
+        _RETRYABLE = {429, 502, 503, 504}
+        _DELAYS = [2, 5, 10]
+        resp = None
+        for delay in [0] + _DELAYS:
+            if delay:
+                time.sleep(delay)
+            resp = self.session.get(url, params=built, timeout=self.timeout)
+            if resp.status_code not in _RETRYABLE:
+                break
+        assert resp is not None
         if resp.status_code == 401:
             raise FirstPromoterError(
                 "Unauthorized (401). Check your API key.", status_code=401
             )
-        if resp.status_code == 429:
-            time.sleep(2)
-            resp = self.session.get(url, params=params or {}, timeout=self.timeout)
         if not resp.ok:
             raise FirstPromoterError(
                 f"API v1 error {resp.status_code} on {path}: {resp.text[:300]}",
@@ -214,7 +270,12 @@ class FirstPromoterV1Client:
             )
         return resp
 
-    def _paginate(self, path: str, params: Optional[Dict[str, Any]] = None) -> List[dict]:
+    def _paginate(
+        self,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        cutoff_date: Optional[datetime] = None,
+    ) -> List[dict]:
         params = dict(params or {})
         params["per_page"] = self.per_page
         rows: List[dict] = []
@@ -231,7 +292,27 @@ class FirstPromoterV1Client:
                 if first_id in seen_first_ids and page > 1:
                     break
                 seen_first_ids.add(first_id)
-            rows.extend(batch)
+            if cutoff_date:
+                filtered = []
+                stop = False
+                for row in batch:
+                    raw_date = row.get("created_at")
+                    if raw_date:
+                        try:
+                            dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            if dt < cutoff_date:
+                                stop = True
+                                break
+                        except (ValueError, AttributeError):
+                            pass
+                    filtered.append(row)
+                rows.extend(filtered)
+                if stop:
+                    break
+            else:
+                rows.extend(batch)
             if len(batch) < self.per_page:
                 break
             page += 1
@@ -240,9 +321,9 @@ class FirstPromoterV1Client:
     def get_promoters(self) -> List[dict]:
         return self._paginate("promoters/list")
 
-    def get_rewards(self) -> List[dict]:
+    def get_rewards(self, cutoff_date: Optional[datetime] = None) -> List[dict]:
         """All rewards/commissions (the v1 equivalent of commissions)."""
-        return self._paginate("rewards/list")
+        return self._paginate("rewards/list", cutoff_date=cutoff_date)
 
     def ping(self) -> bool:
         self._get("promoters/list", {"page": 1, "per_page": 1})

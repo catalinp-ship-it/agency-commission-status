@@ -33,13 +33,17 @@ class DashboardConfig:
     )
     currency_symbol: str = field(default_factory=lambda: os.getenv("FP_CURRENCY", "$"))
     cache_ttl_seconds: int = field(
-        default_factory=lambda: int(os.getenv("FP_CACHE_TTL", "300"))
+        default_factory=lambda: int(os.getenv("FP_CACHE_TTL", "3600"))
     )
     demo_mode: bool = field(
         default_factory=lambda: os.getenv("FP_DEMO", "").lower() in {"1", "true", "yes"}
     )
     # 'auto' tries v2 then falls back to v1; or force 'v1' / 'v2'.
     api_version: str = field(default_factory=lambda: os.getenv("FP_API_VERSION", "auto"))
+    # How many months back to fetch commissions. 0 = no limit (fetch all).
+    lookback_months: int = field(
+        default_factory=lambda: int(os.getenv("FP_LOOKBACK_MONTHS", "6"))
+    )
 
     @property
     def has_credentials(self) -> bool:

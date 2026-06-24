@@ -23,6 +23,7 @@ from commission_dashboard import (
     render_concentration_view,
 )
 from commission_dashboard.fp_client import FirstPromoterError
+from commission_dashboard.data import _load_json_cache, _cache_age_hours
 
 st.set_page_config(
     page_title="Agency Commission Status",
@@ -35,32 +36,26 @@ def sidebar() -> DashboardConfig:
     st.sidebar.title("💸 Commission Status")
     st.sidebar.caption("FirstPromoter agency payouts — Hyros team")
 
-    # Start from env/secrets defaults, then let the user override in-session.
     cfg = DashboardConfig()
-    # Streamlit secrets override env if present.
-    cfg.api_key = st.secrets.get("FP_API_KEY", cfg.api_key) if hasattr(st, "secrets") else cfg.api_key
-    cfg.account_id = (
-        st.secrets.get("FP_ACCOUNT_ID", cfg.account_id) if hasattr(st, "secrets") else cfg.account_id
-    )
+    # Streamlit secrets take priority over env vars.
+    if hasattr(st, "secrets"):
+        cfg.api_key = st.secrets.get("FP_API_KEY", cfg.api_key)
+        cfg.account_id = st.secrets.get("FP_ACCOUNT_ID", cfg.account_id)
 
     with st.sidebar.expander("🔑 Credentials", expanded=not cfg.has_credentials):
         cfg.api_key = st.text_input("API key", value=cfg.api_key or "", type="password") or None
-        cfg.account_id = st.text_input("Account ID", value=cfg.account_id or "") or None
-        st.caption("Tip: set FP_API_KEY / FP_ACCOUNT_ID in a .env or .streamlit/secrets.toml to skip this.")
+        cfg.account_id = st.text_input("Account ID (optional)", value=cfg.account_id or "") or None
+        st.caption("Add FP_API_KEY to Streamlit secrets to persist your key.")
 
     cfg.threshold_days = st.sidebar.number_input(
         "Payout threshold (days)", min_value=1, max_value=365, value=cfg.threshold_days,
         help="Commissions become overdue after this many days from the sale date.",
     )
-    cfg.currency_symbol = st.sidebar.text_input("Currency symbol", value=cfg.currency_symbol)
-
-    version_choice = st.sidebar.selectbox(
-        "API version",
-        ["auto", "v1", "v2"],
-        index=["auto", "v1", "v2"].index(cfg.api_version if cfg.api_version in ("auto", "v1", "v2") else "auto"),
-        help="Auto tries v2 then falls back to v1. v1 needs only an API key; v2 also needs an Account ID.",
+    cfg.lookback_months = st.sidebar.number_input(
+        "Lookback window (months)", min_value=1, max_value=60, value=cfg.lookback_months,
+        help="Only fetch commissions from the last N months. Reduce to speed up loading.",
     )
-    cfg.api_version = version_choice
+    cfg.currency_symbol = st.sidebar.text_input("Currency symbol", value=cfg.currency_symbol)
 
     cfg.demo_mode = st.sidebar.toggle(
         "Demo mode (sample data)",
@@ -111,17 +106,35 @@ def main() -> None:
     if cfg.demo_mode:
         st.warning("Demo mode — showing generated sample data, not your live FirstPromoter account.", icon="🧪")
     elif not cfg.has_credentials:
-        st.info("Enter your FirstPromoter API key and Account ID in the sidebar, or enable Demo mode.", icon="🔑")
+        st.info("Enter your FirstPromoter API key in the sidebar, or enable Demo mode.", icon="🔑")
         return
 
     try:
         data = load_data(cfg, refresh_token=st.session_state.get("refresh_token", 0))
     except FirstPromoterError as e:
-        st.error(f"FirstPromoter API error: {e}")
+        err = str(e)
+        if "429" in err or "1015" in err or "rate limit" in err.lower():
+            st.error(
+                "**Cloudflare is blocking requests to FirstPromoter's v1 API from this server's IP.**\n\n"
+                "This is a known issue with Streamlit Cloud shared hosting. "
+                "**The fix:** enter your **Account ID** in the sidebar — it enables the v2 API "
+                "(`api.firstpromoter.com`) which is not affected by this block.\n\n"
+                "Find your Account ID in your FirstPromoter dashboard URL or under Settings → API.",
+                icon="🚫",
+            )
+        else:
+            st.error(f"FirstPromoter API error: {e}")
         return
     except Exception as e:  # noqa: BLE001
         st.error(f"Failed to load data: {e}")
         return
+
+    # Show data source and freshness.
+    age = _cache_age_hours()
+    if age is not None:
+        st.info(f"📁 Data loaded from pre-fetched cache · Last updated {age:.1f}h ago · Runs every 6h via GitHub Actions", icon=None)
+    else:
+        st.warning("⚠️ Live API mode — set up GitHub Actions for reliable, instant loads.", icon=None)
 
     render_kpi_header(data, cfg)
     st.divider()

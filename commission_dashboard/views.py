@@ -15,6 +15,11 @@ embed any single view:
 
 from __future__ import annotations
 
+import hashlib
+import os
+import pickle
+import tempfile
+import time
 from typing import Dict
 
 import pandas as pd
@@ -23,22 +28,77 @@ import streamlit as st
 from .config import DashboardConfig
 from .data import fetch_demo, fetch_live
 
+# Disk cache lives next to the package; survives Streamlit restarts.
+_DISK_CACHE_DIR = os.path.join(tempfile.gettempdir(), "commission_dashboard_cache")
+_DISK_CACHE_TTL = 3600  # seconds — 1 hour
+os.makedirs(_DISK_CACHE_DIR, exist_ok=True)
+
+
+def _disk_cache_path(cache_key: str) -> str:
+    h = hashlib.sha256(cache_key.encode()).hexdigest()[:16]
+    return os.path.join(_DISK_CACHE_DIR, f"{h}.pkl")
+
+
+def _disk_cache_load(cache_key: str):
+    path = _disk_cache_path(cache_key)
+    try:
+        if os.path.exists(path):
+            age = time.time() - os.path.getmtime(path)
+            if age < _DISK_CACHE_TTL:
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+    except Exception:  # corrupted / unreadable — ignore
+        pass
+    return None
+
+
+def _disk_cache_save(cache_key: str, data) -> None:
+    path = _disk_cache_path(cache_key)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
+
+
+def _disk_cache_invalidate(cache_key: str) -> None:
+    path = _disk_cache_path(cache_key)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
 
 # --------------------------------------------------------------------------
-# Data loading (cached)
+# Data loading (cached — in-memory + disk)
 # --------------------------------------------------------------------------
-@st.cache_data(ttl=300, show_spinner="Loading FirstPromoter data…")
-def _cached_fetch(api_key, account_id, threshold_days, demo, api_version, _buster):
+@st.cache_data(ttl=3600, show_spinner="Loading FirstPromoter data… (first load only — cached for 1 hour after)")
+def _cached_fetch(api_key, account_id, threshold_days, demo, api_version, lookback_months, _buster):
+    # Build a stable cache key (exclude the buster so disk hits survive page reloads).
+    cache_key = f"{api_key}|{account_id}|{threshold_days}|{demo}|{api_version}|{lookback_months}"
+
+    # Try disk cache first (survives Streamlit restarts).
+    cached = _disk_cache_load(cache_key)
+    if cached is not None:
+        return cached
+
     if demo or not api_key:
-        return fetch_demo(threshold_days)
-    return fetch_live(api_key, account_id, threshold_days, api_version)
+        result = fetch_demo(threshold_days)
+    else:
+        result = fetch_live(api_key, account_id, threshold_days, api_version, lookback_months)
+
+    _disk_cache_save(cache_key, result)
+    return result
 
 
 def load_data(cfg: DashboardConfig, refresh_token: int = 0) -> Dict[str, pd.DataFrame]:
     """Load (and cache) dashboard data. Bump `refresh_token` to force a refresh."""
+    if refresh_token:
+        cache_key = f"{cfg.api_key}|{cfg.account_id}|{cfg.threshold_days}|{cfg.demo_mode}|{cfg.api_version}|{cfg.lookback_months}"
+        _disk_cache_invalidate(cache_key)
     return _cached_fetch(
         cfg.api_key, cfg.account_id, cfg.threshold_days, cfg.demo_mode,
-        cfg.api_version, refresh_token,
+        cfg.api_version, cfg.lookback_months, refresh_token,
     )
 
 
