@@ -208,7 +208,7 @@ def _make_cf_session(api_key: str, extra_headers: Optional[Dict[str, str]] = Non
 
     Falls back to a plain requests.Session if cloudscraper is not installed.
     """
-    headers = {"X-API-KEY": api_key, "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
     try:
