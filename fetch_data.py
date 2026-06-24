@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -58,7 +58,6 @@ def fetch_all(path: str, cutoff_date=None) -> list:
                 raw = row.get("created_at", "")
                 if raw:
                     try:
-                        from datetime import timezone
                         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
                         if dt.tzinfo is None:
                             dt = dt.replace(tzinfo=timezone.utc)
@@ -85,7 +84,6 @@ def fetch_all(path: str, cutoff_date=None) -> list:
 def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
 
-    from datetime import timezone
     now = datetime.now(timezone.utc)
     month = now.month - LOOKBACK_MONTHS
     year = now.year + month // 12
