@@ -103,9 +103,8 @@ def main() -> None:
     print(f"Saved {len(promoters)} promoters to {out}")
 
     # Write a manifest so the app knows when data was last fetched.
-    import datetime
     manifest = {
-        "fetched_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
         "rewards_count": len(rewards),
         "promoters_count": len(promoters),
     }
