@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -19,6 +20,7 @@ import requests
 API_KEY = os.environ.get("FP_API_KEY", "")
 BASE_URL = "https://firstpromoter.com/api/v1"
 PER_PAGE = 100
+LOOKBACK_MONTHS = int(os.environ.get("FP_LOOKBACK_MONTHS", "6"))
 DATA_DIR = Path(__file__).parent / "data"
 
 if not API_KEY:
@@ -31,7 +33,7 @@ session.headers.update({
 })
 
 
-def fetch_all(path: str) -> list:
+def fetch_all(path: str, cutoff_date=None) -> list:
     rows = []
     page = 1
     seen = set()
@@ -49,8 +51,31 @@ def fetch_all(path: str) -> list:
         if first_id in seen and page > 1:
             break
         seen.add(first_id)
-        rows.extend(batch)
-        print(f"  Page {page}: {len(batch)} rows (total {len(rows)})")
+        if cutoff_date:
+            filtered = []
+            stop = False
+            for row in batch:
+                raw = row.get("created_at", "")
+                if raw:
+                    try:
+                        from datetime import timezone
+                        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        if dt < cutoff_date:
+                            stop = True
+                            break
+                    except Exception:
+                        pass
+                filtered.append(row)
+            rows.extend(filtered)
+            print(f"  Page {page}: {len(filtered)} rows (total {len(rows)})")
+            if stop:
+                print(f"  Reached cutoff date, stopping.")
+                break
+        else:
+            rows.extend(batch)
+            print(f"  Page {page}: {len(batch)} rows (total {len(rows)})")
         if len(batch) < PER_PAGE:
             break
         page += 1
@@ -60,8 +85,15 @@ def fetch_all(path: str) -> list:
 def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
 
-    print("Fetching rewards...")
-    rewards = fetch_all("rewards/list")
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    month = now.month - LOOKBACK_MONTHS
+    year = now.year + month // 12
+    month = month % 12 or 12
+    cutoff = now.replace(year=year, month=month)
+    print(f"Fetching rewards since {cutoff.date()} ({LOOKBACK_MONTHS} months)...")
+
+    rewards = fetch_all("rewards/list", cutoff_date=cutoff)
     out = DATA_DIR / "rewards.json"
     out.write_text(json.dumps(rewards, indent=2))
     print(f"Saved {len(rewards)} rewards to {out}")
