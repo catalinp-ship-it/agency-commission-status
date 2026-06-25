@@ -20,7 +20,7 @@ import requests
 API_KEY = os.environ.get("FP_API_KEY", "")
 BASE_URL = "https://firstpromoter.com/api/v1"
 PER_PAGE = 100
-LOOKBACK_MONTHS = int(os.environ.get("FP_LOOKBACK_MONTHS", "6"))
+LOOKBACK_MONTHS = int(os.environ.get("FP_LOOKBACK_MONTHS", "0"))  # 0 = fetch all history
 DATA_DIR = Path(__file__).parent / "data"
 
 if not API_KEY:
@@ -84,12 +84,16 @@ def fetch_all(path: str, cutoff_date=None) -> list:
 def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
 
-    now = datetime.now(timezone.utc)
-    month = now.month - LOOKBACK_MONTHS
-    year = now.year + month // 12
-    month = month % 12 or 12
-    cutoff = now.replace(year=year, month=month)
-    print(f"Fetching rewards since {cutoff.date()} ({LOOKBACK_MONTHS} months)...")
+    cutoff = None
+    if LOOKBACK_MONTHS:
+        now = datetime.now(timezone.utc)
+        month = now.month - LOOKBACK_MONTHS
+        year = now.year + month // 12
+        month = month % 12 or 12
+        cutoff = now.replace(year=year, month=month)
+        print(f"Fetching rewards since {cutoff.date()} ({LOOKBACK_MONTHS} months)...")
+    else:
+        print("Fetching all rewards (full history)...")
 
     rewards = fetch_all("rewards/list", cutoff_date=cutoff)
     out = DATA_DIR / "rewards.json"
