@@ -23,7 +23,7 @@ from commission_dashboard import (
     render_concentration_view,
 )
 from commission_dashboard.fp_client import FirstPromoterError
-from commission_dashboard.data import _load_json_cache, _cache_age_hours
+from commission_dashboard.views import cache_age_hours, data_source_info
 
 st.set_page_config(
     page_title="Agency Commission Status",
@@ -51,10 +51,6 @@ def sidebar() -> DashboardConfig:
         "Payout threshold (days)", min_value=1, max_value=365, value=cfg.threshold_days,
         help="Commissions become overdue after this many days from the sale date.",
     )
-    cfg.lookback_months = st.sidebar.number_input(
-        "Lookback window (months)", min_value=1, max_value=60, value=cfg.lookback_months,
-        help="Only fetch commissions from the last N months. Reduce to speed up loading.",
-    )
     cfg.currency_symbol = st.sidebar.text_input("Currency symbol", value=cfg.currency_symbol)
 
     cfg.demo_mode = st.sidebar.toggle(
@@ -64,8 +60,8 @@ def sidebar() -> DashboardConfig:
     )
 
     if st.sidebar.button("🔄 Refresh data", use_container_width=True):
-        st.session_state["refresh_token"] = st.session_state.get("refresh_token", 0) + 1
-        st.cache_data.clear()
+        st.session_state["do_refresh"] = True
+        st.rerun()
 
     return cfg
 
@@ -109,32 +105,33 @@ def main() -> None:
         st.info("Enter your FirstPromoter API key in the sidebar, or enable Demo mode.", icon="🔑")
         return
 
+    force_refresh = bool(st.session_state.pop("do_refresh", False))
     try:
-        data = load_data(cfg, refresh_token=st.session_state.get("refresh_token", 0))
-    except FirstPromoterError as e:
-        err = str(e)
-        if "429" in err or "1015" in err or "rate limit" in err.lower():
-            st.error(
-                "**Cloudflare is blocking requests to FirstPromoter's v1 API from this server's IP.**\n\n"
-                "This is a known issue with Streamlit Cloud shared hosting. "
-                "**The fix:** enter your **Account ID** in the sidebar — it enables the v2 API "
-                "(`api.firstpromoter.com`) which is not affected by this block.\n\n"
-                "Find your Account ID in your FirstPromoter dashboard URL or under Settings → API.",
-                icon="🚫",
-            )
-        else:
-            st.error(f"FirstPromoter API error: {e}")
-        return
+        data = load_data(cfg, force_refresh=force_refresh)
     except Exception as e:  # noqa: BLE001
         st.error(f"Failed to load data: {e}")
         return
 
-    # Show data source and freshness.
-    age = _cache_age_hours()
-    if age is not None:
-        st.info(f"📁 Data loaded from pre-fetched cache · Last updated {age:.1f}h ago · Runs every 6h via GitHub Actions", icon=None)
+    # Banner showing data freshness.
+    info = data_source_info()
+    age  = info["age_hours"]
+    if info["rewards_count"] == 0:
+        st.error(
+            "**No commission data found.** "
+            "The data pipeline hasn't run yet or the last fetch returned 0 records.\n\n"
+            "**Fix:** Go to your GitHub repo → Actions → *Fetch FirstPromoter Data* → "
+            "Run workflow. It will re-fetch all history and push the results.",
+            icon="🚫",
+        )
+    elif age is not None:
+        age_str = f"{age:.1f}h ago" if age < 48 else f"{age/24:.0f} days ago"
+        st.info(
+            f"📁 {info['rewards_count']:,} rewards · {info['promoters_count']:,} promoters · "
+            f"Last updated {age_str} · Refreshes every 6h via GitHub Actions",
+            icon=None,
+        )
     else:
-        st.warning("⚠️ Live API mode — set up GitHub Actions for reliable, instant loads.", icon=None)
+        st.warning("⚠️ No manifest — data may be stale. Trigger a workflow run in GitHub Actions.", icon=None)
 
     render_kpi_header(data, cfg)
     st.divider()
