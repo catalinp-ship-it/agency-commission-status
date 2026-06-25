@@ -411,8 +411,8 @@ def render_time_period_view(data: Dict[str, pd.DataFrame], cfg: DashboardConfig)
         _empty_view("No outstanding commissions in that range.")
         return
 
-    freq = "W" if grain == "Week" else "ME"
-    window["period"] = window["created_at"].dt.to_period(freq).dt.start_time
+    freq = "W" if grain == "Week" else "M"
+    window["period"] = window["created_at"].dt.to_period(freq).dt.to_timestamp()
     series = window.groupby("period")["amount"].sum()
     st.bar_chart(series)
     st.caption(
